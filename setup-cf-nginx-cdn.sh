@@ -1,7 +1,7 @@
 #!/bin/bash
 #========================================
 # Cloudflare + Nginx HTTPS 安全 CDN 一键配置脚本
-# 支持多域名复用（每个域名独立证书和配置）
+# 支持多域名复用 + 自动续期 SSL
 # Author: auto-generated
 # Usage:
 #   非交互模式（curl 一键）:
@@ -13,6 +13,9 @@
 #
 #   交互模式:
 #     sudo ./setup-cf-nginx-cdn.sh
+#
+#   卸载:
+#     curl -fsSL https://raw.githubusercontent.com/deedeenoone/cf-nginx-cdn-setup/main/setup-cf-nginx-cdn.sh | sudo bash -s -- --uninstall --domain api.example.com
 #========================================
 
 set -e
@@ -22,6 +25,7 @@ DOMAIN=""
 SERVICE_PORT=""
 CF_ZONE_ID=""
 CF_API_TOKEN=""
+UNINSTALL=0
 #------------------------------
 
 #---------- 颜色输出 ----------
@@ -53,11 +57,48 @@ while [[ $# -gt 0 ]]; do
             CF_API_TOKEN="$2"
             shift 2
             ;;
+        --uninstall)
+            UNINSTALL=1
+            shift
+            ;;
         *)
             error "未知参数: $1"
             ;;
     esac
 done
+
+#---------- 辅助函数：卸载 ----------
+uninstall_domain() {
+    info "开始卸载 ${DOMAIN} 的配置..."
+
+    # 禁用 Nginx site
+    NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}"
+    NGINX_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}"
+
+    [ -f "$NGINX_CONF" ] && rm -f "$NGINX_CONF" && info "已删除 Nginx 配置: $NGINX_CONF"
+    [ -L "$NGINX_ENABLED" ] && rm -f "$NGINX_ENABLED" && info "已禁用站点: $NGINX_ENABLED"
+
+    # 删除证书
+    [ -f "/etc/ssl/certs/${DOMAIN}.pem" ] && rm -f "/etc/ssl/certs/${DOMAIN}.pem" && info "已删除证书"
+    [ -f "/etc/ssl/private/${DOMAIN}.key" ] && rm -f "/etc/ssl/private/${DOMAIN}.key" && info "已删除私钥"
+
+    # 尝试从 acme.sh 移除（如果存在）
+    if [ -d "$HOME/.acme.sh/${DOMAIN}" ]; then
+        "$HOME/.acme.sh/acme.sh" --remove -d "$DOMAIN" 2>/dev/null || true
+        [ -d "$HOME/.acme.sh/${DOMAIN}" ] && rm -rf "$HOME/.acme.sh/${DOMAIN}"
+        info "已移除 acme.sh 证书"
+    fi
+
+    systemctl reload nginx
+    info "${DOMAIN} 卸载完成"
+    exit 0
+}
+
+#---------- UNINSTALL 模式 ----------
+if [ "$UNINSTALL" -eq 1 ]; then
+    [ -z "$DOMAIN" ] && error "卸载需要 --domain 参数"
+    uninstall_domain
+fi
 
 #---------- 检查 root ----------
 [ "$EUID" -ne 0 ] && error "请使用 root 或 sudo 运行"
@@ -71,46 +112,70 @@ done
 info "开始配置..."
 
 #========================================
-# 0. 安全检查：避免重复配置同一域名
+# 0. 安全检查：避免重复配置
 #========================================
 NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}"
 NGINX_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}"
 
 if [ -f "$NGINX_CONF" ]; then
-    info "检测到 ${DOMAIN} 已存在配置，跳过 Nginx/SSL 创建步骤..."
-    info "如需重新配置，请先运行：sudo rm -f ${NGINX_CONF} ${NGINX_ENABLED}"
-    SKIP_NGINX=1
+    info "检测到 ${DOMAIN} 已存在配置，跳过创建步骤..."
+    info "如需重新配置，请先卸载："
+    echo "  curl ... | sudo bash -s -- --uninstall --domain ${DOMAIN}"
+    SKIP_CREATE=1
 else
-    SKIP_NGINX=0
+    SKIP_CREATE=0
 fi
 
 #========================================
 # 1. 安装依赖
 #========================================
-info "安装 nginx curl ufw openssl..."
+info "安装 nginx curl ufw openssl acme.sh..."
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx curl ufw openssl
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx curl ufw openssl socat
+
+# 安装 acme.sh（Let's Encrypt / 通用证书工具）
+if [ ! -d "$HOME/.acme.sh" ]; then
+    curl https://get.acme.sh | sh -s email=root@localhost.com
+fi
 
 info "依赖安装完成"
 
 #========================================
-# 2. 生成该域名专属的 Origin SSL 证书
+# 2. 安装 acme.sh 并申请 Origin CA 证书（自动续期）
 #========================================
-if [ "$SKIP_NGINX" -eq 0 ]; then
-    info "生成 Cloudflare Origin SSL 证书..."
+if [ "$SKIP_CREATE" -eq 0 ]; then
+    info "通过 acme.sh + Cloudflare API 申请 SSL 证书（自动续期）..."
 
+    # 配置 Cloudflare API Token（写入 acme.sh 配置）
+    export CF_Token="$CF_API_TOKEN"
+
+    # 申请证书（Cloudflare DNS 验证，ZeroSSL CA）
+    "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt 2>/dev/null || true
+
+    "$HOME/.acme.sh/acme.sh" --issue \
+        --dns dns_cf \
+        -d "$DOMAIN" \
+        --keylength 2048 \
+        --auto-upgrade 1 \
+        --home "$HOME/.acme.sh" \
+        --config-home "$HOME/.acme.sh" \
+        2>&1 | tail -5
+
+    # 安装证书到 Nginx 目录
     mkdir -p /etc/ssl/certs /etc/ssl/private
 
-    # 按域名隔离证书，避免覆盖
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout "/etc/ssl/private/${DOMAIN}.key" \
-        -out "/etc/ssl/certs/${DOMAIN}.pem" \
-        -subj "/CN=$DOMAIN/O=Cloudflare-Origin" 2>/dev/null
+    "$HOME/.acme.sh/acme.sh" --install-cert -d "$DOMAIN" \
+        --key-file "/etc/ssl/private/${DOMAIN}.key" \
+        --cert-file "/etc/ssl/certs/${DOMAIN}.pem" \
+        --reloadcmd "systemctl reload nginx" \
+        --home "$HOME/.acme.sh" \
+        --config-home "$HOME/.acme.sh" \
+        2>&1 | tail -3
 
     chmod 600 /etc/ssl/private/${DOMAIN}.key
     chmod 644 /etc/ssl/certs/${DOMAIN}.pem
 
-    info "证书生成完成: /etc/ssl/certs/${DOMAIN}.pem"
+    info "证书安装完成（自动续期已配置）"
 fi
 
 #========================================
@@ -138,9 +203,9 @@ else
 fi
 
 #========================================
-# 4. 配置 Nginx（该域名专属）
+# 4. 配置 Nginx
 #========================================
-if [ "$SKIP_NGINX" -eq 0 ]; then
+if [ "$SKIP_CREATE" -eq 0 ]; then
     info "配置 Nginx..."
 
     cat > "$NGINX_CONF" << EOF
@@ -154,7 +219,7 @@ server {
     listen 443 ssl;
     server_name ${DOMAIN};
 
-    # ========== SSL 配置（该域名专属证书） ==========
+    # ========== SSL 配置（自动续期证书） ==========
     ssl_certificate /etc/ssl/certs/${DOMAIN}.pem;
     ssl_certificate_key /etc/ssl/private/${DOMAIN}.key;
     ssl_session_timeout 1d;
@@ -196,21 +261,19 @@ server {
 }
 EOF
 
-    # 启用站点（如果未启用）
     [ ! -L "$NGINX_ENABLED" ] && ln -s "$NGINX_CONF" "$NGINX_ENABLED" || info "站点已启用"
+    [ -f /etc/nginx/sites-enabled/default ] && rm -f /etc/nginx/sites-enabled/default
 
-    # 测试并重载
     nginx -t && systemctl reload nginx
 
     info "Nginx 配置完成"
 fi
 
 #========================================
-# 5. 防火墙：每个域名只允许 Cloudflare IP
+# 5. 配置防火墙
 #========================================
 info "配置防火墙..."
 
-# Cloudflare IPv4/IPv6 列表
 CF_IPS=(
     "173.245.48.0/20"
     "103.21.244.0/22"
@@ -232,7 +295,6 @@ ufw allow 22/tcp comment 'SSH' 2>/dev/null || true
 ufw allow 80/tcp comment 'HTTP' 2>/dev/null || true
 
 for ip in "${CF_IPS[@]}"; do
-    # 检查规则是否已存在，避免重复添加
     ufw status | grep -q "$ip.*443" && continue
     ufw allow from $ip to any port 443 proto tcp comment "Cloudflare" 2>/dev/null || true
 done
@@ -247,20 +309,16 @@ info "防火墙配置完成"
 BLOCK_CONF="/etc/nginx/sites-available/block-default"
 
 if [ ! -f "$BLOCK_CONF" ]; then
-    info "创建 block-default 配置（阻止直接 IP 访问）..."
-
     cat > "$BLOCK_CONF" << 'EOF'
 server {
     listen 443 default_server;
     server_name _;
-    ssl_certificate /etc/ssl/certs/cloudflare-origin.pem;
-    ssl_certificate_key /etc/ssl/private/cloudflare-origin.key;
+    ssl_certificate /etc/ssl/certs/${DOMAIN}.pem;
+    ssl_certificate_key /etc/ssl/private/${DOMAIN}.key;
     return 444;
 }
 EOF
-
     ln -sf "$BLOCK_CONF" /etc/nginx/sites-enabled/block-default
-    systemctl reload nginx
     info "block-default 已创建"
 else
     info "block-default 已存在，跳过"
@@ -280,8 +338,10 @@ echo "Nginx配置:   ${NGINX_CONF}"
 echo "内部服务:    localhost:${SERVICE_PORT}"
 echo "公网IP:      ${PUBLIC_IP}"
 echo ""
-echo "已存在的域名配置:"
+echo "已配置的域名:"
 ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | grep -v block-default
+echo ""
+echo "证书续期:    ${GREEN}自动（acme.sh 每 60 天续期）${NC}"
 echo ""
 echo "请确保 Cloudflare SSL/TLS 模式设置为:"
 echo -e "  ${GREEN}Full (strict)${NC}"
