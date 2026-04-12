@@ -26,9 +26,13 @@ done
 [[ -z "$ZONE_ID" ]] && read -p "Zone ID: " ZONE_ID
 [[ -z "$CF_TOKEN" ]] && read -p "CF Token: " CF_TOKEN
 
-echo "[INFO] Installing dependencies..."
-apt-get update -qq
-apt-get install -y -qq nginx curl ufw openssl socat > /dev/null 2>&1
+if ! command -v nginx &> /dev/null; then
+    echo "[INFO] Installing dependencies..."
+    apt-get update -qq
+    apt-get install -y -qq nginx curl ufw openssl socat > /dev/null 2>&1
+else
+    echo "[INFO] Dependencies already installed, skipping..."
+fi
 
 echo "[INFO] Installing acme.sh..."
 curl https://get.acme.sh | sh -s email=root@localhost.com > /dev/null 2>&1
