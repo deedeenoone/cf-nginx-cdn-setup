@@ -38,7 +38,12 @@ echo "[INFO] Installing acme.sh..."
 curl https://get.acme.sh | sh -s email=root@localhost.com > /dev/null 2>&1
 
 # Ensure nginx is running before certificate operations
-systemctl start nginx || true
+if systemctl is-active --quiet nginx 2>/dev/null || pgrep nginx > /dev/null 2>&1; then
+    echo "[INFO] Nginx already running, skipping start..."
+else
+    echo "[INFO] Starting nginx..."
+    systemctl start nginx || true
+fi
 
 echo "[INFO] Getting certificate..."
 export CF_Token="$CF_TOKEN"
