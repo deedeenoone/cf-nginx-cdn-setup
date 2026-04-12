@@ -36,8 +36,12 @@ curl https://get.acme.sh | sh -s email=root@localhost.com > /dev/null 2>&1
 echo "[INFO] Getting certificate..."
 export CF_Token="$CF_TOKEN"
 ~/.acme.sh/acme.sh --set-default-ca --server "$CA" || { echo "[ERROR] Failed to set CA"; exit 1; }
-echo "[INFO] Issuing certificate..."
-~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --server "$CA" || { echo "[ERROR] Certificate issue failed"; exit 1; }
+if [ -f "$HOME/.acme.sh/$DOMAIN/fullchain.cer" ]; then
+    echo "[INFO] Certificate already exists, skipping issue..."
+else
+    echo "[INFO] Issuing certificate..."
+    ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --server "$CA" --force || { echo "[ERROR] Certificate issue failed"; exit 1; }
+fi
 echo "[INFO] Installing certificate..."
 ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
     --key-file /etc/ssl/private/"$DOMAIN".key \
