@@ -33,26 +33,33 @@ apt-get install -y -qq nginx curl ufw openssl socat > /dev/null 2>&1
 echo "[INFO] Installing acme.sh..."
 curl https://get.acme.sh | sh -s email=root@localhost.com > /dev/null 2>&1
 
+# Ensure nginx is running before certificate operations
+systemctl start nginx || true
+
 echo "[INFO] Getting certificate..."
 export CF_Token="$CF_TOKEN"
 ~/.acme.sh/acme.sh --set-default-ca --server "$CA" || { echo "[ERROR] Failed to set CA"; exit 1; }
+
+# Check if certificate is already issued
 if [ -f "$HOME/.acme.sh/$DOMAIN/fullchain.cer" ]; then
-    echo "[INFO] Certificate already exists and valid, skipping..."
+    echo "[INFO] Certificate already issued, skipping..."
 else
     echo "[INFO] Issuing certificate..."
     ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --server "$CA" --force || { echo "[ERROR] Certificate issue failed"; exit 1; }
 fi
-echo "[INFO] Installing certificate..."
-~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
-    --key-file /etc/ssl/private/"$DOMAIN".key \
-    --cert-file /etc/ssl/certs/"$DOMAIN".pem \
-    --reloadcmd "systemctl reload nginx" || { echo "[ERROR] Certificate install failed"; exit 1; }
 
-chmod 600 /etc/ssl/private/"$DOMAIN".key 2>/dev/null || true
-chmod 644 /etc/ssl/certs/"$DOMAIN".pem 2>/dev/null || true
-
-# Ensure nginx is running before certificate install
-systemctl start nginx || true
+# Check if certificate is already installed
+if [ -f "/etc/ssl/certs/$DOMAIN.pem" ] && [ -f "/etc/ssl/private/$DOMAIN.key" ]; then
+    echo "[INFO] Certificate already installed, skipping..."
+else
+    echo "[INFO] Installing certificate..."
+    ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
+        --key-file /etc/ssl/private/"$DOMAIN".key \
+        --cert-file /etc/ssl/certs/"$DOMAIN".pem \
+        --reloadcmd "systemctl reload nginx" || { echo "[ERROR] Certificate install failed"; exit 1; }
+    chmod 600 /etc/ssl/private/"$DOMAIN".key 2>/dev/null || true
+    chmod 644 /etc/ssl/certs/"$DOMAIN".pem 2>/dev/null || true
+fi
 
 IP=$(curl -s ifconfig.me)
 echo "[INFO] Adding DNS record ($IP)..."
