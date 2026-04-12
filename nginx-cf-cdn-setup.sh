@@ -51,6 +51,9 @@ echo "[INFO] Installing certificate..."
 chmod 600 /etc/ssl/private/"$DOMAIN".key 2>/dev/null || true
 chmod 644 /etc/ssl/certs/"$DOMAIN".pem 2>/dev/null || true
 
+# Ensure nginx is running before certificate install
+systemctl start nginx || true
+
 IP=$(curl -s ifconfig.me)
 echo "[INFO] Adding DNS record ($IP)..."
 curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
